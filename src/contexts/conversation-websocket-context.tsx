@@ -326,6 +326,11 @@ export function ConversationWebSocketProvider({
   // `queryParams` below) and advanced per durable frame without re-rendering.
   const mainCursorRef = useRef<SeqCursor>(createSeqCursor());
   const planningCursorRef = useRef<SeqCursor>(createSeqCursor());
+  // Latest reconnect handles, for stepping back below a seq gap the cursor
+  // had to step over (see the observe callbacks below). Assigned after the
+  // useWebSocket calls that define them.
+  const reconnectMainRef = useRef<(() => void) | null>(null);
+  const reconnectPlanningRef = useRef<(() => void) | null>(null);
   const mainReplayThroughSeqRef = useRef<number | null>(null);
   const planningReplayThroughSeqRef = useRef<number | null>(null);
   // The newest status seen in the replay so far. Applied once the replay
@@ -780,6 +785,12 @@ export function ConversationWebSocketProvider({
             const cursor = mainCursorRef.current;
             const previousSeq = cursor.value ?? -1;
             cursor.observe(seq);
+            // A hole the cursor had to step over asks for one replay from
+            // below it — recycle the socket now; the next connect consumes
+            // the pending base and the store dedups the redelivery.
+            if (cursor.hasPendingRefetch()) {
+              reconnectMainRef.current?.();
+            }
             const throughSeq = mainReplayThroughSeqRef.current;
             if (
               throughSeq !== null &&
@@ -1079,7 +1090,15 @@ export function ConversationWebSocketProvider({
         const routed = routeSessionFrame(
           JSON.parse(messageEvent.data),
           planningDeltaBatcherRef.current,
-          planningCursorRef.current.observe,
+          (seq) => {
+            const cursor = planningCursorRef.current;
+            cursor.observe(seq);
+            // See the main socket's observe callback: one replay from below
+            // a stepped-over hole.
+            if (cursor.hasPendingRefetch()) {
+              reconnectPlanningRef.current?.();
+            }
+          },
           planningReplayThroughSeqRef.current,
           (throughSeq) => {
             planningReplayThroughSeqRef.current = throughSeq;
@@ -1304,7 +1323,13 @@ export function ConversationWebSocketProvider({
     // renders instantly and the event store dedupes the overlap by id.
     const queryParams = () => {
       const cursor = mainCursorRef.current;
-      cursor.start(cursor.value ?? historyAfterSeqRef.current ?? -1);
+      // A stepped-over gap asks for one replay from below the hole (see
+      // session-seq-cursor.ts): the server redelivers the range and the
+      // store dedups it, so a dropped batch is not silently lost.
+      const refetchBase = cursor.takeRefetchBase();
+      cursor.start(
+        refetchBase ?? cursor.value ?? historyAfterSeqRef.current ?? -1,
+      );
       return { after_seq: String(cursor.value) };
     };
 
@@ -1355,7 +1380,10 @@ export function ConversationWebSocketProvider({
     // from the start on a first connect and from its cursor after that.
     const queryParams = () => {
       const cursor = planningCursorRef.current;
-      cursor.start(cursor.value ?? -1);
+      // See the main socket's queryParams: one replay from below a
+      // stepped-over hole.
+      const refetchBase = cursor.takeRefetchBase();
+      cursor.start(refetchBase ?? cursor.value ?? -1);
       return { after_seq: String(cursor.value) };
     };
 
@@ -1433,6 +1461,11 @@ export function ConversationWebSocketProvider({
     reconnect: reconnectPlanning,
     disconnect: disconnectPlanning,
   } = useWebSocket(planningAgentWsUrl || "", planningWebsocketOptions);
+
+  useEffect(() => {
+    reconnectMainRef.current = reconnectMain;
+    reconnectPlanningRef.current = reconnectPlanning;
+  }, [reconnectMain, reconnectPlanning]);
 
   // Messages submitted on a cloud backend while the target conversation has
   // no runtime URL (sandbox PAUSED/STARTING) have nowhere to go: the V1 agent

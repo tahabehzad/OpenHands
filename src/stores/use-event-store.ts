@@ -8,12 +8,23 @@ import {
   type StreamingSlotMeta,
   type UIEvent,
 } from "#/utils/handle-event-for-ui";
+import { isStreamingDeltaEvent } from "#/types/agent-server/type-guards";
 import type {
   DeltaFrame,
   ItemStartedFrame,
 } from "#/types/agent-server/session-frames";
 
 export type OHEvent = UIEvent;
+
+/**
+ * The store holds one conversation's events and used to grow without bound
+ * within a long session. Cap it at `MAX_EVENTS_PER_CONVERSATION` durable
+ * events (and their uiEvents rows): eviction drops the oldest rows and
+ * removes their ids from `eventIds`, so scroll-up REST pagination can
+ * refetch them, while open streaming slots (provisional text being
+ * rendered) are never dropped.
+ */
+export const MAX_EVENTS_PER_CONVERSATION = 1000;
 
 const getEventId = (event: OHEvent): string | number | undefined =>
   "id" in event ? event.id : undefined;
@@ -157,8 +168,59 @@ const sortEventState = (
   uiEvents: [...state.uiEvents].sort(compare),
 });
 
+/**
+ * Cap `events` and `uiEvents` at `MAX_EVENTS_PER_CONVERSATION`. Eviction
+ * takes the oldest rows (the front of the timestamp-sorted arrays), skipping
+ * open streaming slots in `uiEvents` so nothing mid-render is dropped, and
+ * removes an evicted durable event's id from `eventIds` — otherwise
+ * scroll-up REST pagination would dedupe the refetched row away and the
+ * history would stay blank below the cap.
+ */
+const capEventState = (state: EventState): EventState => {
+  const eventsOverflow = state.events.length - MAX_EVENTS_PER_CONVERSATION;
+  const uiOverflow = state.uiEvents.length - MAX_EVENTS_PER_CONVERSATION;
+  if (eventsOverflow <= 0 && uiOverflow <= 0) {
+    return state;
+  }
+
+  let eventIds = state.eventIds;
+  let events = state.events;
+  if (eventsOverflow > 0) {
+    eventIds = new Set(eventIds);
+    for (const evicted of state.events.slice(0, eventsOverflow)) {
+      const id = getEventId(evicted);
+      if (id !== undefined) eventIds.delete(id);
+    }
+    events = state.events.slice(eventsOverflow);
+  }
+
+  let uiEvents = state.uiEvents;
+  if (uiOverflow > 0) {
+    // Walk from the front and drop the oldest non-slot rows; open streaming
+    // slots stay until their durable event retires or the socket recycles.
+    const drop = new Set<number>();
+    for (let i = 0; i < uiEvents.length && drop.size < uiOverflow; i += 1) {
+      if (!isStreamingDeltaEvent(uiEvents[i])) {
+        drop.add(i);
+      }
+    }
+    if (drop.size > 0) {
+      uiEvents = uiEvents.filter((_, i) => !drop.has(i));
+    }
+  }
+
+  if (
+    events === state.events &&
+    uiEvents === state.uiEvents &&
+    eventIds === state.eventIds
+  ) {
+    return state;
+  }
+  return { ...state, events, eventIds, uiEvents };
+};
+
 const applyAddEvent = (state: EventState, event: OHEvent): EventState => {
-  const next = appendEvent(state, event);
+  const next = capEventState(appendEvent(state, event));
   if (next === state) {
     return state;
   }
@@ -170,7 +232,7 @@ const applyAddEvent = (state: EventState, event: OHEvent): EventState => {
     return next;
   }
 
-  return sortEventState(next);
+  return capEventState(sortEventState(next));
 };
 
 export const useEventStore = create<EventState>()((set) => ({
@@ -234,9 +296,11 @@ export const useEventStore = create<EventState>()((set) => ({
             (incomingOrder.get(a) ?? incomingOrder.size) -
               (incomingOrder.get(b) ?? incomingOrder.size)
         : compareEventsByTimestamp;
-      return sortEventState(
-        { ...state, events, eventIds, uiEvents, historyPagination },
-        compare,
+      return capEventState(
+        sortEventState(
+          { ...state, events, eventIds, uiEvents, historyPagination },
+          compare,
+        ),
       );
     }),
   clearEvents: () =>
@@ -267,7 +331,9 @@ export const useEventStore = create<EventState>()((set) => ({
         return state;
       }
       const uiEvents = openStreamingSlot(frame, state.uiEvents, meta);
-      return uiEvents === state.uiEvents ? state : { ...state, uiEvents };
+      return uiEvents === state.uiEvents
+        ? state
+        : capEventState({ ...state, uiEvents });
     }),
   appendStreamingDeltas: (frames: DeltaFrame[], meta: StreamingSlotMeta = {}) =>
     set((state) => {
@@ -277,7 +343,9 @@ export const useEventStore = create<EventState>()((set) => ({
         // stream is over and a straggling delta must not reopen it.
         isFinished: (itemId) => state.eventIds.has(itemId),
       });
-      return uiEvents === state.uiEvents ? state : { ...state, uiEvents };
+      return uiEvents === state.uiEvents
+        ? state
+        : capEventState({ ...state, uiEvents });
     }),
   abortStreamingSlot: (itemId: string, attempt?: number) =>
     set((state) => {

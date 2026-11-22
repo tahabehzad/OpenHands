@@ -1,6 +1,9 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { useEventStore } from "#/stores/use-event-store";
+import {
+  MAX_EVENTS_PER_CONVERSATION,
+  useEventStore,
+} from "#/stores/use-event-store";
 import {
   ActionEvent,
   MessageEvent,
@@ -8,6 +11,7 @@ import {
   SecurityRisk,
 } from "#/types/agent-server/core";
 import { StreamingDeltaEvent } from "#/types/agent-server/core/events/streaming-delta-event";
+import { isStreamingDeltaEvent } from "#/types/agent-server/type-guards";
 
 const mockUserMessageEvent: MessageEvent = {
   id: "test-event-1",
@@ -329,5 +333,82 @@ describe("useEventStore", () => {
     // Verify events were cleared
     expect(result.current.events).toEqual([]);
     expect(result.current.uiEvents).toEqual([]);
+  });
+
+  it("caps the log at MAX_EVENTS_PER_CONVERSATION and releases evicted ids", () => {
+    const { result } = renderHook(() => useEventStore());
+    const total = MAX_EVENTS_PER_CONVERSATION + 5;
+
+    act(() => {
+      for (let i = 0; i < total; i += 1) {
+        result.current.addEvent(
+          makeUserMessageEvent(`cap-${i}`, String(1_700_000_000_000 + i)),
+        );
+      }
+    });
+
+    const { events, eventIds } = result.current;
+    expect(events).toHaveLength(MAX_EVENTS_PER_CONVERSATION);
+    expect(events[0].id).toBe("cap-5");
+    expect(events[events.length - 1].id).toBe(`cap-${total - 1}`);
+    // Evicted ids must leave the dedupe set, or scroll-up pagination would
+    // filter refetched rows away and the history below the cap stays blank.
+    expect(eventIds.has("cap-0")).toBe(false);
+
+    // A redelivered evicted event is no longer deduped away: it re-enters at
+    // the tail (its id is free) and the oldest row is evicted to make room.
+    act(() => {
+      result.current.addEvent(
+        makeUserMessageEvent("cap-0", String(1_700_000_000_000 + total)),
+      );
+    });
+    expect(result.current.events).toHaveLength(MAX_EVENTS_PER_CONVERSATION);
+    expect(result.current.events[result.current.events.length - 1].id).toBe(
+      "cap-0",
+    );
+  });
+
+  it("caps bulk history loads the same way", () => {
+    const { result } = renderHook(() => useEventStore());
+
+    act(() => {
+      result.current.addEvents(
+        Array.from({ length: MAX_EVENTS_PER_CONVERSATION + 10 }, (_, i) =>
+          makeUserMessageEvent(`bulk-${i}`, String(1_700_000_000_000 + i)),
+        ),
+      );
+    });
+
+    const { events } = result.current;
+    expect(events).toHaveLength(MAX_EVENTS_PER_CONVERSATION);
+    expect(events[0].id).toBe("bulk-10");
+    expect(events[events.length - 1].id).toBe(
+      `bulk-${MAX_EVENTS_PER_CONVERSATION + 9}`,
+    );
+  });
+
+  it("never evicts an open streaming slot while capping", () => {
+    const { result } = renderHook(() => useEventStore());
+
+    act(() => {
+      result.current.openStreamingSlot({
+        type: "item_started",
+        item_id: "slot-1",
+      });
+      for (let i = 0; i < MAX_EVENTS_PER_CONVERSATION + 10; i += 1) {
+        result.current.addEvent(
+          makeUserMessageEvent(`cap-${i}`, String(1_700_000_000_000 + i)),
+        );
+      }
+    });
+
+    const { events, uiEvents } = result.current;
+    expect(events).toHaveLength(MAX_EVENTS_PER_CONVERSATION);
+    expect(uiEvents).toHaveLength(MAX_EVENTS_PER_CONVERSATION);
+    expect(
+      uiEvents.some(
+        (event) => isStreamingDeltaEvent(event) && event.id === "slot-1",
+      ),
+    ).toBe(true);
   });
 });
